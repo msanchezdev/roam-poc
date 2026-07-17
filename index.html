@@ -53,6 +53,17 @@
   .row{display:flex;gap:10px}
   .row .btn{flex:1}
   .footnote{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:center;line-height:1.7;padding-bottom:12px}
+  .clsbtns{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .clsbtns button{border:1px solid var(--hair);background:var(--panel2);color:var(--ink);border-radius:14px;padding:16px 8px;font-family:var(--sans);font-weight:700;font-size:16px;cursor:pointer}
+  .clsbtns button:active{transform:scale(.97);border-color:var(--amber)}
+  #cls-card{border-color:var(--amber)}
+  .qchip{display:block;width:100%;text-align:center;font-family:var(--mono);font-size:12px;letter-spacing:.08em;padding:10px;border-radius:100px;border:1px dashed var(--amber);color:var(--amber);background:none;cursor:pointer}
+  .cls-row{display:flex;flex-direction:column;gap:8px;background:var(--panel);border:1px solid var(--hair);border-radius:12px;padding:11px 13px}
+  .cls-row .m{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .cls-row .mini{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+  .cls-row .mini button{border:1px solid var(--hair);background:var(--panel2);color:var(--ink);border-radius:9px;padding:8px 4px;font-size:12px;font-weight:600;cursor:pointer}
+  .cls-row.done{opacity:.55}
+  .cls-row.done .mini{display:none}
 </style>
 </head>
 <body>
@@ -101,6 +112,18 @@
       <div class="stat"><div id="hud-bumps" class="v">0</div><div class="l">BUMPS</div></div>
       <div class="stat"><div id="hud-acc" class="v" style="font-size:16px;padding-top:5px">—</div><div class="l">GPS ±M</div></div>
     </div>
+    <div id="cls-card" class="card hidden" style="display:flex;flex-direction:column;gap:12px">
+      <div class="sec-label" style="color:var(--amber)">WHAT WAS THAT?</div>
+      <div id="cls-info" class="hint"></div>
+      <div class="clsbtns">
+        <button data-l="bump">🟡 Bump</button>
+        <button data-l="hole">🕳️ Hole</button>
+        <button data-l="dip">〰️ Dip</button>
+        <button data-l="none">✕ Nothing</button>
+      </div>
+      <div class="hint" style="font-size:10.5px">answer only when stopped — it queues by itself in 12 s</div>
+    </div>
+    <button id="cls-queue" class="qchip hidden">🏷 0 to classify — tap when stopped</button>
     <canvas id="cv-live" height="240"></canvas>
     <button id="btn-stop" class="btn danger">■ &nbsp;End drive</button>
   </div>
@@ -126,6 +149,11 @@
     <div style="height:6px"></div>
     <div id="rc-note" class="hint" style="text-align:center"></div>
     <div style="height:10px"></div>
+    <div id="rc-classify" class="hidden">
+      <div class="sec-label" style="margin-bottom:8px">CLASSIFY YOUR BUMPS — what was each one really?</div>
+      <div id="rc-cls-list" class="rides"></div>
+      <div style="height:10px"></div>
+    </div>
     <div class="row">
       <button id="btn-export" class="btn ghost">⇩ Export JSON</button>
       <button id="btn-new" class="btn primary">New drive</button>
@@ -133,7 +161,7 @@
   </div>
 
   <div style="flex:1"></div>
-  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.2 pwa · gps-glitch-proof scoring · data stays on this device until you export it</div>
+  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.3 pwa · gps-glitch-proof · bump classifier · data stays on this device until you export it</div>
 </div>
 <div id="toast" class="toast"></div>
 
@@ -147,6 +175,8 @@ function show(name){ for (const k in views) views[k].classList.toggle("hidden", 
 let ride = null, watchId = null, wakeLock = null, timerId = null, audioCtx = null;
 let gravity = {x:0,y:0,z:0}, gravityInit = false, lastBumpT = 0, lastChimeT = 0, cellsAtLastChime = 0;
 let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, lastRmsT = 0;
+let ringBuf = [], pendingCls = [], activeClsId = null, clsTimer = null, bumpSeq = 0;
+const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ Nothing"};
 
 const GRID = 0.00045;
 const BUMP_G = 4.6;
@@ -161,17 +191,19 @@ function newRide(){ return {startedAt:Date.now(), points:[], bumps:[], peaks:[],
 setInterval(()=>{ $("clock").textContent = new Date().toTimeString().slice(0,5); }, 1000);
 
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 2600); }
-function chime(){
+function tone(f1,f2,dur,vol){
   try{
     audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
     const o=audioCtx.createOscillator(), g=audioCtx.createGain();
-    o.type="sine"; o.frequency.setValueAtTime(880,audioCtx.currentTime);
-    o.frequency.exponentialRampToValueAtTime(1318,audioCtx.currentTime+0.12);
-    g.gain.setValueAtTime(0.12,audioCtx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+0.5);
-    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.55);
+    o.type="sine"; o.frequency.setValueAtTime(f1,audioCtx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(f2,audioCtx.currentTime+dur*0.25);
+    g.gain.setValueAtTime(vol,audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001,audioCtx.currentTime+dur);
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+dur+0.05);
   }catch(e){}
 }
+function chime(){ tone(880,1318,0.5,0.12); }
+function thud(){ tone(220,150,0.28,0.16); }
 
 function setChip(id, txt, cls){ const el=$(id); el.textContent=txt; el.className="chip"+(cls?" "+cls:""); }
 
@@ -221,8 +253,13 @@ function onMotion(e){
   gravity.x=gravity.x*0.94+a.x*0.06; gravity.y=gravity.y*0.94+a.y*0.06; gravity.z=gravity.z*0.94+a.z*0.06;
   const hx=a.x-gravity.x, hy=a.y-gravity.y, hz=a.z-gravity.z;
   const mag=Math.sqrt(hx*hx+hy*hy+hz*hz);
+  const gmag=Math.sqrt(gravity.x**2+gravity.y**2+gravity.z**2)||9.8;
+  const vert=(hx*gravity.x+hy*gravity.y+hz*gravity.z)/gmag;
+  const nowB=Date.now();
+  ringBuf.push({t:nowB,v:+vert.toFixed(2)});
+  while(ringBuf.length && nowB-ringBuf[0].t>2600) ringBuf.shift();
   if (!ride || !ride.lastFix) return;
-  const sp=ride.lastFix.sp||0, now=Date.now();
+  const sp=ride.lastFix.sp||0, now=nowB;
   if (sp>BUMP_MIN_SPEED){
     rmsSumSq+=mag*mag; rmsN++;
     if (now-lastRmsT>2000 && rmsN>5){
@@ -236,11 +273,57 @@ function onMotion(e){
   }
   if (mag>BUMP_G && sp>BUMP_MIN_SPEED && now-lastBumpT>1800){
     lastBumpT=now;
-    ride.bumps.push({t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
+    const ev={id:++bumpSeq,t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1),label:null,wave:null};
+    ride.bumps.push(ev);
     $("hud-bumps").textContent=ride.bumps.length;
-    toast("● bump logged ("+mag.toFixed(1)+" m/s²)");
+    setTimeout(()=>{ try{
+      const w=ringBuf.filter(s=>s.t>=ev.t-1200 && s.t<=ev.t+1200).map(s=>s.v);
+      ev.wave = w.length>220 ? w.filter((_,i)=>i%2===0) : w;
+    }catch(e){} },1300);
+    thud();
+    pendingCls.push(ev.id);
+    updateQueueChip();
+    if(activeClsId==null) showNextCls();
   }
 }
+
+function bumpById(id){ return window.__lastRide && !ride ? (window.__lastRide.bumps||[]).find(b=>b.id===id) : (ride? ride.bumps.find(b=>b.id===id) : null); }
+function updateQueueChip(){
+  const q=$("cls-queue");
+  if(pendingCls.length && activeClsId==null){ q.textContent="🏷 "+pendingCls.length+" to classify — tap when stopped"; q.classList.remove("hidden"); }
+  else q.classList.add("hidden");
+}
+function showNextCls(){
+  if(activeClsId!=null || !pendingCls.length || !ride) return;
+  activeClsId=pendingCls[0];
+  const b=ride.bumps.find(x=>x.id===activeClsId);
+  if(!b){ pendingCls.shift(); activeClsId=null; return; }
+  const ago=Math.round((Date.now()-b.t)/1000);
+  $("cls-info").textContent=b.mag.toFixed(1)+" m/s² at "+Math.round(b.sp)+" km/h · "+(ago<5?"just now":ago+"s ago");
+  $("cls-card").classList.remove("hidden");
+  updateQueueChip();
+  clearTimeout(clsTimer);
+  clsTimer=setTimeout(()=>{ $("cls-card").classList.add("hidden"); activeClsId=null; updateQueueChip(); },12000);
+}
+function applyLabel(id,label){
+  const src = ride || window.__lastRide; if(!src) return;
+  const b=(src.bumps||[]).find(x=>x.id===id); if(!b) return;
+  b.label=label;
+  pendingCls=pendingCls.filter(x=>x!==id);
+  tone(660,880,0.15,0.08);
+}
+document.querySelectorAll("#cls-card .clsbtns button").forEach(btn=>{
+  btn.onclick=()=>{
+    if(activeClsId==null) return;
+    clearTimeout(clsTimer);
+    applyLabel(activeClsId,btn.dataset.l);
+    $("cls-card").classList.add("hidden");
+    activeClsId=null;
+    updateQueueChip();
+    setTimeout(showNextCls,700);
+  };
+});
+$("cls-queue").onclick=()=>showNextCls();
 
 async function requestMotion(){
   try{
@@ -309,6 +392,7 @@ function stopDrive(){
   if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
   window.removeEventListener("devicemotion", onMotion);
   clearInterval(timerId);
+  clearTimeout(clsTimer); activeClsId=null; pendingCls=[]; $("cls-card").classList.add("hidden"); $("cls-queue").classList.add("hidden");
   if(wakeLock){ try{wakeLock.release();}catch(e){} wakeLock=null; }
   if(!ride) return;
   ride.endedAt=Date.now();
@@ -334,13 +418,41 @@ function renderRecap(r){
   show("recap");
   requestAnimationFrame(()=>drawTrace($("cv-recap"), r, false));
   window.__lastRide=r;
+  renderClsList(r);
+}
+
+function syncLabelToStorage(startedAt,id,label){
+  try{
+    const rides=loadRides();
+    const rr=rides.find(x=>x.startedAt===startedAt); if(!rr) return;
+    const b=(rr.bumps||[]).find(x=>x.id===id); if(b){ b.label=label; localStorage.setItem("roam_rides",JSON.stringify(rides)); }
+  }catch(e){}
+}
+function renderClsList(r){
+  const box=$("rc-classify"), list=$("rc-cls-list");
+  const bumps=r.bumps||[];
+  box.classList.toggle("hidden",bumps.length===0);
+  if(!bumps.length) return;
+  list.innerHTML="";
+  const t0=r.startedAt;
+  bumps.forEach(b=>{
+    const row=document.createElement("div");
+    row.className="cls-row"+(b.label?" done":"");
+    const mm=Math.floor((b.t-t0)/60000), ss=String(Math.floor(((b.t-t0)%60000)/1000)).padStart(2,"0");
+    row.innerHTML='<span class="m">'+mm+":"+ss+" · "+b.mag.toFixed(1)+" m/s² · "+Math.round(b.sp)+" km/h"+(b.label?" — "+(LABELS[b.label]||b.label):"")+'</span>'+
+      (b.label?"":'<div class="mini">'+Object.keys(LABELS).map(l=>'<button data-l="'+l+'">'+LABELS[l]+'</button>').join("")+'</div>');
+    row.querySelectorAll("button").forEach(btn=>{
+      btn.onclick=()=>{ applyLabel(b.id,btn.dataset.l); syncLabelToStorage(r.startedAt,b.id,btn.dataset.l); renderClsList(r); };
+    });
+    list.appendChild(row);
+  });
 }
 
 function loadRides(){ try{ return JSON.parse(localStorage.getItem("roam_rides")||"[]"); }catch(e){ return []; } }
 function saveRide(r){
   const rides=loadRides();
   rides.unshift({startedAt:r.startedAt,endedAt:r.endedAt,dist:r.dist,smooth:r.smooth,maxSp:r.maxSp,
-    cells:Object.keys(r.cells).length,bumps:r.bumps,events:r.events,points:r.points,
+    cells:Object.keys(r.cells).length,bumps:r.bumps.map(b=>{const {wave,...rest}=b; return rest;}),events:r.events,points:r.points,
     roughCount:(r.rough||[]).length,peakCount:(r.peaks||[]).length});
   while(JSON.stringify(rides).length>4500000 && rides.length>1) rides.pop();
   try{ localStorage.setItem("roam_rides",JSON.stringify(rides)); }catch(e){ rides[0].points=rides[0].points.filter((_,i)=>i%3===0); try{localStorage.setItem("roam_rides",JSON.stringify(rides));}catch(e2){} }
