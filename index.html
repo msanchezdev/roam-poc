@@ -133,7 +133,7 @@
   </div>
 
   <div style="flex:1"></div>
-  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.1 pwa · data stays on this device until you export it</div>
+  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.2 pwa · gps-glitch-proof scoring · data stays on this device until you export it</div>
 </div>
 <div id="toast" class="toast"></div>
 
@@ -146,14 +146,17 @@ function show(name){ for (const k in views) views[k].classList.toggle("hidden", 
 
 let ride = null, watchId = null, wakeLock = null, timerId = null, audioCtx = null;
 let gravity = {x:0,y:0,z:0}, gravityInit = false, lastBumpT = 0, lastChimeT = 0, cellsAtLastChime = 0;
-let motionOK = false, lastMotionT = 0;
+let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, lastRmsT = 0;
 
 const GRID = 0.00045;
 const BUMP_G = 4.6;
 const BUMP_MIN_SPEED = 1.5;
-const BRAKE_MS2 = 3.0, ACCEL_MS2 = 2.6;
+const BRAKE_MS2 = 3.0, ACCEL_MS2 = 3.0;
+const A_PLAUSIBLE = 8;      // |accel| beyond this is GPS noise, never driver behavior
+const EVENT_ACC_MAX = 25;   // GPS accuracy (m) required to trust speed deltas
+const PEAK_LOG = 2.8;       // silent sub-threshold peak logging for calibration
 
-function newRide(){ return {startedAt:Date.now(), points:[], bumps:[], events:[], cells:{}, dist:0, maxSp:0, smooth:100, lastFix:null}; }
+function newRide(){ return {startedAt:Date.now(), points:[], bumps:[], peaks:[], rough:[], events:[], cells:{}, dist:0, maxSp:0, smooth:100, lastFix:null}; }
 
 setInterval(()=>{ $("clock").textContent = new Date().toTimeString().slice(0,5); }, 1000);
 
@@ -190,20 +193,21 @@ function onPosition(p){
     if (dt>0 && d<300){
       ride.dist += d;
       if (fix.sp==null) fix.sp = d/dt;
-      if (prev.sp!=null && fix.sp!=null && dt>=0.5 && dt<6){
+      if (prev.sp!=null && fix.sp!=null && dt>=0.5 && dt<3 && fix.acc<=EVENT_ACC_MAX && prev.acc<=EVENT_ACC_MAX){
         const a=(fix.sp-prev.sp)/dt;
-        if (a < -BRAKE_MS2){ ride.events.push({type:"hard_brake",t:now,lat:fix.lat,lon:fix.lon,a:+a.toFixed(2)}); ride.smooth=Math.max(0,ride.smooth-4); }
+        if (Math.abs(a) > A_PLAUSIBLE){ ride.events.push({type:"gps_glitch",t:now,a:+a.toFixed(2),acc:Math.round(fix.acc)}); }
+        else if (a < -BRAKE_MS2){ ride.events.push({type:"hard_brake",t:now,lat:fix.lat,lon:fix.lon,a:+a.toFixed(2)}); ride.smooth=Math.max(0,ride.smooth-4); }
         else if (a > ACCEL_MS2){ ride.events.push({type:"harsh_accel",t:now,lat:fix.lat,lon:fix.lon,a:+a.toFixed(2)}); ride.smooth=Math.max(0,ride.smooth-3); }
       }
+      if (fix.sp!=null && fix.acc<=EVENT_ACC_MAX && prev.sp!=null && (fix.sp-prev.sp)<=A_PLAUSIBLE*Math.max(dt,1)) ride.maxSp=Math.max(ride.maxSp,fix.sp);
     }
   }
-  if (fix.sp!=null) ride.maxSp=Math.max(ride.maxSp,fix.sp);
   ride.points.push(fix); ride.lastFix=fix;
   const key = Math.round(fix.lat/GRID)+"_"+Math.round(fix.lon/GRID);
   if (!ride.cells[key]){
     ride.cells[key]=1;
     const n=Object.keys(ride.cells).length;
-    if (n-cellsAtLastChime>=3 && now-lastChimeT>9000){ chime(); toast("✦ new ground — "+n+" cells lit"); lastChimeT=now; cellsAtLastChime=n; }
+    if (n-cellsAtLastChime>=4 && now-lastChimeT>12000){ chime(); toast("✦ new ground — "+n+" cells lit"); lastChimeT=now; cellsAtLastChime=n; }
   }
   updateHUD(fix);
   if (ride.points.length%4===0) drawTrace($("cv-live"), ride, true);
@@ -219,6 +223,17 @@ function onMotion(e){
   const mag=Math.sqrt(hx*hx+hy*hy+hz*hz);
   if (!ride || !ride.lastFix) return;
   const sp=ride.lastFix.sp||0, now=Date.now();
+  if (sp>BUMP_MIN_SPEED){
+    rmsSumSq+=mag*mag; rmsN++;
+    if (now-lastRmsT>2000 && rmsN>5){
+      ride.rough.push({t:now,rms:+Math.sqrt(rmsSumSq/rmsN).toFixed(3),sp:+(sp*3.6).toFixed(1),lat:ride.lastFix.lat,lon:ride.lastFix.lon});
+      rmsSumSq=0; rmsN=0; lastRmsT=now;
+    }
+    if (mag>PEAK_LOG && now-lastPeakT>800){
+      lastPeakT=now;
+      ride.peaks.push({t:now,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
+    }
+  }
   if (mag>BUMP_G && sp>BUMP_MIN_SPEED && now-lastBumpT>1800){
     lastBumpT=now;
     ride.bumps.push({t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
@@ -325,7 +340,8 @@ function loadRides(){ try{ return JSON.parse(localStorage.getItem("roam_rides")|
 function saveRide(r){
   const rides=loadRides();
   rides.unshift({startedAt:r.startedAt,endedAt:r.endedAt,dist:r.dist,smooth:r.smooth,maxSp:r.maxSp,
-    cells:Object.keys(r.cells).length,bumps:r.bumps,events:r.events,points:r.points});
+    cells:Object.keys(r.cells).length,bumps:r.bumps,events:r.events,points:r.points,
+    roughCount:(r.rough||[]).length,peakCount:(r.peaks||[]).length});
   while(JSON.stringify(rides).length>4500000 && rides.length>1) rides.pop();
   try{ localStorage.setItem("roam_rides",JSON.stringify(rides)); }catch(e){ rides[0].points=rides[0].points.filter((_,i)=>i%3===0); try{localStorage.setItem("roam_rides",JSON.stringify(rides));}catch(e2){} }
   renderRideList();
