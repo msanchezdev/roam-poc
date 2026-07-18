@@ -74,7 +74,7 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">ROAM <small>· v0 ride logger</small></div>
+    <div class="logo">ROAM <small>· <span id="ver">v?</span> ride logger</small></div>
     <div id="clock" class="chip">--:--</div>
   </header>
 
@@ -168,14 +168,17 @@
   </div>
 
   <div style="flex:1"></div>
-  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.4 pwa · live map · bump classifier · data stays on this device until you export it</div>
+  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam <span id="ver2"></span> pwa · live map · bump classifier · data stays on this device until you export it</div>
 </div>
 <div id="toast" class="toast"></div>
 
 <script>
 (() => {
 "use strict";
+const APP_VERSION = "v0.5";
 const $ = id => document.getElementById(id);
+$("ver").textContent = APP_VERSION;
+$("ver2").textContent = APP_VERSION;
 const views = {idle:$("view-idle"), drive:$("view-drive"), recap:$("view-recap")};
 function show(name){ for (const k in views) views[k].classList.toggle("hidden", k!==name); }
 
@@ -592,6 +595,11 @@ $("btn-stop").onclick=stopDrive;
 $("btn-new").onclick=()=>{ destroyMaps(); renderRideList(); show("idle"); };
 
 if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  let refreshed = false;
+  navigator.serviceWorker.addEventListener("controllerchange", ()=>{
+    if (hadController && !refreshed && !ride){ refreshed = true; location.reload(); }
+  });
   window.addEventListener("load", ()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
 }
 

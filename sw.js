@@ -1,4 +1,4 @@
-const CACHE = "roam-v0-6";
+const CACHE = "roam-v0-7";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
@@ -14,6 +14,17 @@ self.addEventListener("activate", e => {
 
 self.addEventListener("fetch", e => {
   if (e.request.method !== "GET") return;
+  const isDoc = e.request.mode === "navigate" || e.request.destination === "document";
+  if (isDoc) {
+    e.respondWith(
+      fetch(e.request).then(res => {
+        const copy = res.clone();
+        caches.open(CACHE).then(c => c.put("./index.html", copy));
+        return res;
+      }).catch(() => caches.match("./index.html"))
+    );
+    return;
+  }
   e.respondWith(
     caches.match(e.request, { ignoreSearch: true }).then(hit =>
       hit || fetch(e.request).then(res => {
