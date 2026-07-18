@@ -142,7 +142,7 @@
     <div class="grid3">
       <div class="stat"><div id="hud-cells" class="v amber">0</div><div class="l">CELLS LIT</div></div>
       <div class="stat"><div id="hud-bumps" class="v">0</div><div class="l">BUMPS</div></div>
-      <div class="stat"><div id="hud-acc" class="v" style="font-size:16px;padding-top:5px">—</div><div class="l">GPS ±M</div></div>
+      <div class="stat"><div id="hud-acc" class="v" style="font-size:16px;padding-top:5px">—</div><div class="l">GPS · IMU</div></div>
     </div>
     <div id="cls-card" class="card hidden" style="display:flex;flex-direction:column;gap:12px">
       <div class="sec-label" style="color:var(--amber)">WHAT WAS THAT?</div>
@@ -202,7 +202,7 @@
 <script>
 (() => {
 "use strict";
-const APP_VERSION = "v0.7";
+const APP_VERSION = "v0.8";
 const $ = id => document.getElementById(id);
 $("ver").textContent = APP_VERSION;
 $("ver2").textContent = APP_VERSION;
@@ -212,6 +212,8 @@ function show(name){ for (const k in views) views[k].classList.toggle("hidden", 
 let ride = null, watchId = null, wakeLock = null, timerId = null, audioCtx = null;
 let gravity = {x:0,y:0,z:0}, gravityInit = false, lastBumpT = 0, lastChimeT = 0, cellsAtLastChime = 0;
 let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, lastRmsT = 0;
+let imuCount = 0, imuHz = 0, imuSrc = "—", genericSensor = null;
+setInterval(()=>{ imuHz = imuCount; imuCount = 0; }, 1000);
 let ringBuf = [], pendingCls = [], activeClsId = null, clsTimer = null, bumpSeq = 0;
 const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ Nothing"};
 let liveMap = null, recapMap = null, lastEase = 0;
@@ -460,12 +462,25 @@ function onPosition(p){
 }
 function onPosError(e){ setChip("dg-gps","GPS: "+(e.code===1?"denied":"error"),"bad"); }
 
-function onMotion(e){
-  const a=e.accelerationIncludingGravity; if(!a||a.x==null) return;
-  motionOK=true; lastMotionT=Date.now();
-  if(!gravityInit){ gravity={x:a.x,y:a.y,z:a.z}; gravityInit=true; return; }
-  gravity.x=gravity.x*0.94+a.x*0.06; gravity.y=gravity.y*0.94+a.y*0.06; gravity.z=gravity.z*0.94+a.z*0.06;
-  const hx=a.x-gravity.x, hy=a.y-gravity.y, hz=a.z-gravity.z;
+function isMoving(){
+  if(!ride||!ride.lastFix) return false;
+  if((ride.lastFix.sp||0)>1) return true;
+  const pts=ride.points; if(pts.length<2) return false;
+  if(Date.now()-ride.lastFix.t>10000) return false;
+  for(let i=pts.length-1;i>=0;i--){ if(ride.lastFix.t-pts[i].t>8000) return haversine(pts[i],ride.lastFix)>10; }
+  return false;
+}
+function onSample(x,y,z,inclGravity){
+  motionOK=true; lastMotionT=Date.now(); imuCount++;
+  let hx,hy,hz;
+  if(inclGravity){
+    if(!gravityInit){ gravity={x,y,z}; gravityInit=true; return; }
+    gravity.x=gravity.x*0.94+x*0.06; gravity.y=gravity.y*0.94+y*0.06; gravity.z=gravity.z*0.94+z*0.06;
+    hx=x-gravity.x; hy=y-gravity.y; hz=z-gravity.z;
+  } else {
+    if(!gravityInit){ gravity={x:0,y:0,z:9.8}; gravityInit=true; }
+    hx=x; hy=y; hz=z;
+  }
   const mag=Math.sqrt(hx*hx+hy*hy+hz*hz);
   const gmag=Math.sqrt(gravity.x**2+gravity.y**2+gravity.z**2)||9.8;
   const vert=(hx*gravity.x+hy*gravity.y+hz*gravity.z)/gmag;
@@ -474,7 +489,7 @@ function onMotion(e){
   while(ringBuf.length && nowB-ringBuf[0].t>2600) ringBuf.shift();
   if (!ride || !ride.lastFix) return;
   const sp=ride.lastFix.sp||0, now=nowB;
-  if (sp>BUMP_MIN_SPEED){
+  if (isMoving()){
     rmsSumSq+=mag*mag; rmsN++;
     if (now-lastRmsT>2000 && rmsN>5){
       ride.rough.push({t:now,rms:+Math.sqrt(rmsSumSq/rmsN).toFixed(3),sp:+(sp*3.6).toFixed(1),lat:ride.lastFix.lat,lon:ride.lastFix.lon});
@@ -485,9 +500,9 @@ function onMotion(e){
       ride.peaks.push({t:now,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
     }
   }
-  if (mag>BUMP_G && sp>BUMP_MIN_SPEED && now-lastBumpT>1800){
+  if (mag>BUMP_G && isMoving() && now-lastBumpT>1800){
     lastBumpT=now;
-    const ev={id:++bumpSeq,t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1),label:null,wave:null};
+    const ev={id:++bumpSeq,t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1),src:imuSrc,label:null,wave:null};
     ride.bumps.push(ev);
     $("hud-bumps").textContent=ride.bumps.length;
     setTimeout(()=>{ try{
@@ -539,6 +554,31 @@ document.querySelectorAll("#cls-card .clsbtns button").forEach(btn=>{
 });
 $("cls-queue").onclick=()=>showNextCls();
 
+function onMotion(e){
+  const a=e.accelerationIncludingGravity;
+  if(a && a.x!=null){ imuSrc="dm"; onSample(a.x,a.y,a.z,true); return; }
+  const l=e.acceleration;
+  if(l && l.x!=null){ imuSrc="dm-lin"; onSample(l.x,l.y,l.z,false); }
+}
+function startGenericAccel(){
+  try{
+    if("Accelerometer" in window){
+      genericSensor=new Accelerometer({frequency:60});
+      genericSensor.addEventListener("reading",()=>{ imuSrc="accel"; onSample(genericSensor.x,genericSensor.y,genericSensor.z,true); });
+      genericSensor.addEventListener("error",()=>{ genericSensor=null; });
+      genericSensor.start(); return true;
+    }
+  }catch(e){ genericSensor=null; }
+  try{
+    if("LinearAccelerationSensor" in window){
+      genericSensor=new LinearAccelerationSensor({frequency:60});
+      genericSensor.addEventListener("reading",()=>{ imuSrc="lin"; onSample(genericSensor.x,genericSensor.y,genericSensor.z,false); });
+      genericSensor.addEventListener("error",()=>{ genericSensor=null; });
+      genericSensor.start(); return true;
+    }
+  }catch(e){ genericSensor=null; }
+  return false;
+}
 async function requestMotion(){
   try{
     if (typeof DeviceMotionEvent!=="undefined" && typeof DeviceMotionEvent.requestPermission==="function"){
@@ -546,8 +586,9 @@ async function requestMotion(){
       if(r!=="granted"){ setChip("dg-motion","MOTION: denied","bad"); return; }
     }
     window.addEventListener("devicemotion", onMotion);
-    setTimeout(()=>{ setChip("dg-motion", motionOK?"MOTION: live":"MOTION: no data", motionOK?"ok":"bad"); }, 1500);
-  }catch(e){ setChip("dg-motion","MOTION: blocked","bad"); }
+    setTimeout(()=>{ if(!motionOK) startGenericAccel(); }, 1800);
+    setTimeout(()=>{ setChip("dg-motion", motionOK?("MOTION: "+imuSrc+" "+imuHz+"Hz"):"MOTION: dead — check site sensor permission", motionOK?"ok":"bad"); }, 3200);
+  }catch(e){ setChip("dg-motion","MOTION: blocked","bad"); if(startGenericAccel()) setChip("dg-motion","MOTION: sensor api","ok"); }
 }
 
 async function getWakeLock(){
@@ -601,13 +642,17 @@ async function startDrive(){
   await requestMotion(); await getWakeLock();
   if(!("geolocation" in navigator)){ setChip("dg-gps","GPS: unsupported","bad"); toast("no geolocation in this browser"); ride=null; return; }
   watchId=navigator.geolocation.watchPosition(onPosition,onPosError,{enableHighAccuracy:true,maximumAge:0,timeout:15000});
-  timerId=setInterval(()=>{ if(ride) $("hud-time").textContent=fmtTime(Date.now()-ride.startedAt); },1000);
+  timerId=setInterval(()=>{ if(ride){
+    $("hud-time").textContent=fmtTime(Date.now()-ride.startedAt);
+    $("hud-acc").textContent=(ride.lastFix?Math.round(ride.lastFix.acc):"—")+" · "+(motionOK?imuHz+"hz":"✗");
+  } },1000);
   show("drive"); toast("recording — drive safe");
 }
 
 function stopDrive(){
   if(watchId!=null){ navigator.geolocation.clearWatch(watchId); watchId=null; }
   window.removeEventListener("devicemotion", onMotion);
+  try{ if(genericSensor){ genericSensor.stop(); genericSensor=null; } }catch(e){ genericSensor=null; }
   clearInterval(timerId);
   clearTimeout(clsTimer); activeClsId=null; pendingCls=[]; $("cls-card").classList.add("hidden"); $("cls-queue").classList.add("hidden");
   nav=null; $("nav-banner").classList.add("hidden"); try{ speechSynthesis.cancel(); }catch(e){}
@@ -704,7 +749,7 @@ $("btn-test").onclick=async()=>{
   const out=$("test-out"); out.classList.remove("hidden"); out.textContent="testing…";
   await requestMotion();
   let gpsMsg="waiting for GPS…";
-  const summary=()=>gpsMsg+" · motion "+(motionOK?"OK (accel streaming)":"no data yet — move the phone");
+  const summary=()=>gpsMsg+" · motion "+(motionOK?("OK — "+imuSrc+" @ "+imuHz+" Hz (shake to see peaks)"):"no data yet — shake the phone; if still dead, check Chrome site settings → Motion sensors");
   navigator.geolocation && navigator.geolocation.getCurrentPosition(
     p=>{ gpsMsg="GPS OK ±"+Math.round(p.coords.accuracy)+" m"; setChip("dg-gps",gpsMsg,"ok"); out.textContent=summary(); },
     e=>{ gpsMsg="GPS "+(e.code===1?"DENIED — allow location for this site":"error "+e.code); setChip("dg-gps","GPS: fail","bad"); out.textContent=summary(); },
