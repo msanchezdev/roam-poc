@@ -214,7 +214,7 @@
 <script>
 (() => {
 "use strict";
-const APP_VERSION = "v0.10";
+const APP_VERSION = "v0.11";
 const $ = id => document.getElementById(id);
 $("ver").textContent = APP_VERSION;
 $("ver2").textContent = APP_VERSION;
@@ -225,7 +225,9 @@ let ride = null, watchId = null, wakeLock = null, timerId = null, audioCtx = nul
 let gravity = {x:0,y:0,z:0}, gravityInit = false, lastBumpT = 0, lastChimeT = 0, cellsAtLastChime = 0;
 let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, lastRmsT = 0;
 let imuCount = 0, imuHz = 0, imuSrc = "—", genericSensor = null;
+let actEma = 0, lastActiveT = Date.now();
 setInterval(()=>{ imuHz = imuCount; imuCount = 0; }, 1000);
+function deviceStill(){ return motionOK && imuHz>10 && Date.now()-lastActiveT>5000; }
 let ringBuf = [], pendingCls = [], activeClsId = null, clsTimer = null, bumpSeq = 0;
 const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ False alarm", unsure:"🤷 Not sure"};
 let liveMap = null, recapMap = null, lastEase = 0;
@@ -443,12 +445,15 @@ function onPosition(p){
   if (c.accuracy>18 && (c.speed==null||c.speed<0)) coarseN++; else { coarseN=0; if(coarseWarned){ coarseWarned=false; $("fix-warn").classList.add("hidden"); } }
   if (coarseN>=6 && !coarseWarned){ coarseWarned=true; $("fix-warn").classList.remove("hidden"); toast("⚠ coarse location — check precise location"); }
   if (c.accuracy > 40) { $("hud-acc").textContent = Math.round(c.accuracy); return; }
+  const still=deviceStill();
   const gpsSp=(c.speed!=null && c.speed>=0)?c.speed:null;
-  const fix = {t:now, lat:c.latitude, lon:c.longitude, sp:gpsSp, src:gpsSp!=null?"g":"n", acc:c.accuracy};
+  const fix = {t:now, lat:c.latitude, lon:c.longitude, sp:still?0:gpsSp, src:still?"s":(gpsSp!=null?"g":"n"), acc:c.accuracy};
   const prev = ride.lastFix;
+  let lastD=0;
   if (prev){
     const d = haversine(prev,fix), dt=(fix.t-prev.t)/1000;
-    if (dt>0 && d<300){
+    lastD=d;
+    if (dt>0 && d<300 && !still && d>Math.max(3,fix.acc*0.4)){
       ride.dist += d;
       let derived=(dt>0.3 && dt<6 && fix.acc<=30)? d/dt : null;
       if (derived!=null && derived<0.8) derived=0;
@@ -464,12 +469,13 @@ function onPosition(p){
   }
   ride.points.push(fix); ride.lastFix=fix;
   const key = Math.round(fix.lat/GRID)+"_"+Math.round(fix.lon/GRID);
-  if (!ride.cells[key]){
+  const canLight = !still && ((fix.sp||0)>1.2 || lastD>Math.max(15,fix.acc));
+  if (!ride.cells[key] && canLight){
     ride.cells[key]=1;
     const n=Object.keys(ride.cells).length;
     if (n-cellsAtLastChime>=4 && now-lastChimeT>12000){ chime(); toast("✦ new ground — "+n+" cells lit"); lastChimeT=now; cellsAtLastChime=n; }
   }
-  if(!parkAnchor || haversine(parkAnchor,fix)>Math.max(25,fix.acc)){
+  if(!still && (!parkAnchor || haversine(parkAnchor,fix)>Math.max(25,fix.acc))){
     parkAnchor=fix; lastMoveT=now;
     if(parkPrompted){ parkPrompted=false; $("park-card").classList.add("hidden"); }
   } else if(now-lastMoveT>180000 && !parkPrompted){
@@ -492,6 +498,7 @@ function isMoving(){
   return false;
 }
 function isMovingStrict(){
+  if(deviceStill()) return false;
   if(!ride||!ride.lastFix) return false;
   if((ride.lastFix.sp||0)>1.2) return true;
   const pts=ride.points; if(pts.length<2) return false;
@@ -511,6 +518,8 @@ function onSample(x,y,z,inclGravity){
     hx=x; hy=y; hz=z;
   }
   const mag=Math.sqrt(hx*hx+hy*hy+hz*hz);
+  actEma = actEma*0.95 + mag*0.05;
+  if (actEma > 0.22) lastActiveT = Date.now();
   const gmag=Math.sqrt(gravity.x**2+gravity.y**2+gravity.z**2)||9.8;
   const vert=(hx*gravity.x+hy*gravity.y+hz*gravity.z)/gmag;
   const nowB=Date.now();
@@ -518,7 +527,7 @@ function onSample(x,y,z,inclGravity){
   while(ringBuf.length && nowB-ringBuf[0].t>2600) ringBuf.shift();
   if (!ride || !ride.lastFix) return;
   const sp=ride.lastFix.sp||0, now=nowB;
-  if (isMoving()){
+  if (!deviceStill()){
     rmsSumSq+=mag*mag; rmsN++;
     if (now-lastRmsT>2000 && rmsN>5){
       ride.rough.push({t:now,rms:+Math.sqrt(rmsSumSq/rmsN).toFixed(3),sp:+(sp*3.6).toFixed(1),lat:ride.lastFix.lat,lon:ride.lastFix.lon});
