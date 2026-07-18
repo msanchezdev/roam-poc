@@ -11,6 +11,8 @@
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>ROAM v0 — Ride Logger</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js" defer></script>
 <style>
   :root{--bg:#0E1417;--panel:#161E22;--panel2:#1E282D;--ink:#E8E4DA;--muted:#8A9299;--hair:#29343A;--amber:#FFB23E;--mint:#5FD0A0;--danger:#E8604C;
   --mono:ui-monospace,"SF Mono","Roboto Mono",Menlo,Consolas,monospace;--sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
@@ -43,6 +45,9 @@
   .stat .v.amber{color:var(--amber)} .stat .v.mint{color:var(--mint)}
   .stat .l{font-family:var(--mono);font-size:9px;letter-spacing:.18em;color:var(--muted);margin-top:3px}
   canvas{width:100%;border-radius:14px;background:#0A1013;border:1px solid var(--hair);display:block}
+  .mapbox{width:100%;border-radius:14px;border:1px solid var(--hair);overflow:hidden;background:#0A1013}
+  #map-live{height:240px} #map-recap{height:300px}
+  .maplibregl-ctrl-attrib{font-size:9px;opacity:.6}
   .rides{display:flex;flex-direction:column;gap:8px}
   .ride-row{display:flex;justify-content:space-between;align-items:center;background:var(--panel);border:1px solid var(--hair);border-radius:12px;padding:11px 13px;cursor:pointer;font-family:var(--mono);font-size:12px}
   .ride-row .d{color:var(--ink)} .ride-row .s{color:var(--muted)}
@@ -124,6 +129,7 @@
       <div class="hint" style="font-size:10.5px">answer only when stopped — it queues by itself in 12 s</div>
     </div>
     <button id="cls-queue" class="qchip hidden">🏷 0 to classify — tap when stopped</button>
+    <div id="map-live" class="mapbox hidden"></div>
     <canvas id="cv-live" height="240"></canvas>
     <button id="btn-stop" class="btn danger">■ &nbsp;End drive</button>
   </div>
@@ -136,6 +142,7 @@
       <div id="rc-sub" class="hint"></div>
     </div>
     <div style="height:10px"></div>
+    <div id="map-recap" class="mapbox hidden"></div>
     <canvas id="cv-recap" height="300"></canvas>
     <div style="height:10px"></div>
     <div class="grid">
@@ -161,7 +168,7 @@
   </div>
 
   <div style="flex:1"></div>
-  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.3 pwa · gps-glitch-proof · bump classifier · data stays on this device until you export it</div>
+  <div class="footnote">bumps &amp; road conditions never lower your score — roads are the road's fault<br>roam v0.4 pwa · live map · bump classifier · data stays on this device until you export it</div>
 </div>
 <div id="toast" class="toast"></div>
 
@@ -177,6 +184,89 @@ let gravity = {x:0,y:0,z:0}, gravityInit = false, lastBumpT = 0, lastChimeT = 0,
 let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, lastRmsT = 0;
 let ringBuf = [], pendingCls = [], activeClsId = null, clsTimer = null, bumpSeq = 0;
 const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ Nothing"};
+let liveMap = null, recapMap = null, lastEase = 0;
+
+const MAP_STYLE = {
+  version: 8,
+  sources: { carto: { type:"raster",
+    tiles:["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png","https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png","https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png"],
+    tileSize:256, attribution:"© OpenStreetMap · © CARTO" } },
+  layers: [{ id:"base", type:"raster", source:"carto" }]
+};
+function mapsAvailable(){ return typeof maplibregl!=="undefined" && navigator.onLine; }
+function cellPolys(cellsObj){
+  const feats=[];
+  for(const k of Object.keys(cellsObj||{})){
+    const [a,b]=k.split("_").map(Number); if(isNaN(a)||isNaN(b)) continue;
+    const la=a*GRID, lo=b*GRID, h=GRID/2;
+    feats.push({type:"Feature",geometry:{type:"Polygon",coordinates:[[[lo-h,la-h],[lo+h,la-h],[lo+h,la+h],[lo-h,la+h],[lo-h,la-h]]]}});
+  }
+  return {type:"FeatureCollection",features:feats};
+}
+function rideGeo(r){
+  return {
+    trace:{type:"Feature",geometry:{type:"LineString",coordinates:(r.points||[]).map(p=>[p.lon,p.lat])}},
+    bumps:{type:"FeatureCollection",features:(r.bumps||[]).map(b=>({type:"Feature",properties:{label:b.label||""},geometry:{type:"Point",coordinates:[b.lon,b.lat]}}))},
+    cells: typeof r.cells==="object" ? cellPolys(r.cells) : {type:"FeatureCollection",features:[]}
+  };
+}
+function addRideLayers(map, r){
+  const g=rideGeo(r);
+  map.addSource("cells",{type:"geojson",data:g.cells});
+  map.addLayer({id:"cells",type:"fill",source:"cells",paint:{"fill-color":"#FFB23E","fill-opacity":0.13}});
+  map.addSource("trace",{type:"geojson",data:g.trace});
+  map.addLayer({id:"trace-glow",type:"line",source:"trace",paint:{"line-color":"#FFB23E","line-width":9,"line-opacity":0.25,"line-blur":4}});
+  map.addLayer({id:"trace",type:"line",source:"trace",paint:{"line-color":"#FFB23E","line-width":3.5,"line-opacity":0.95}});
+  map.addSource("bumps",{type:"geojson",data:g.bumps});
+  map.addLayer({id:"bumps",type:"circle",source:"bumps",paint:{"circle-radius":5,"circle-color":"#5FD0A0","circle-stroke-color":"#0A1013","circle-stroke-width":1.5}});
+}
+function refreshRideLayers(map, r){
+  if(!map || !map.getSource("trace")) return;
+  const g=rideGeo(r);
+  map.getSource("trace").setData(g.trace);
+  map.getSource("bumps").setData(g.bumps);
+  map.getSource("cells").setData(g.cells);
+}
+function initLiveMap(fix){
+  if(!mapsAvailable() || liveMap) return;
+  try{
+    $("map-live").classList.remove("hidden"); $("cv-live").classList.add("hidden");
+    liveMap=new maplibregl.Map({container:"map-live",style:MAP_STYLE,center:[fix.lon,fix.lat],zoom:16,attributionControl:{compact:true},dragRotate:false,pitchWithRotate:false});
+    liveMap.on("load",()=>{
+      addRideLayers(liveMap, ride||{points:[],bumps:[],cells:{}});
+      liveMap.addSource("pos",{type:"geojson",data:{type:"Feature",geometry:{type:"Point",coordinates:[fix.lon,fix.lat]}}});
+      liveMap.addLayer({id:"pos-glow",type:"circle",source:"pos",paint:{"circle-radius":14,"circle-color":"#FFB23E","circle-opacity":0.25}});
+      liveMap.addLayer({id:"pos",type:"circle",source:"pos",paint:{"circle-radius":7,"circle-color":"#FFB23E","circle-stroke-color":"#0E1417","circle-stroke-width":2.5}});
+    });
+    liveMap.on("error",()=>{});
+  }catch(e){ liveMap=null; $("map-live").classList.add("hidden"); $("cv-live").classList.remove("hidden"); }
+}
+function updateLiveMap(fix){
+  if(!liveMap) return;
+  try{
+    const ps=liveMap.getSource("pos"); if(ps) ps.setData({type:"Feature",geometry:{type:"Point",coordinates:[fix.lon,fix.lat]}});
+    refreshRideLayers(liveMap, ride);
+    const now=Date.now();
+    if(now-lastEase>2500){ lastEase=now; liveMap.easeTo({center:[fix.lon,fix.lat],duration:1200}); }
+  }catch(e){}
+}
+function destroyMaps(){
+  try{ if(liveMap){ liveMap.remove(); liveMap=null; } }catch(e){ liveMap=null; }
+  try{ if(recapMap){ recapMap.remove(); recapMap=null; } }catch(e){ recapMap=null; }
+  $("map-live").classList.add("hidden"); $("cv-live").classList.remove("hidden");
+}
+function showRecapMap(r){
+  if(!mapsAvailable() || !(r.points||[]).length){ $("map-recap").classList.add("hidden"); $("cv-recap").classList.remove("hidden"); return; }
+  try{
+    $("map-recap").classList.remove("hidden"); $("cv-recap").classList.add("hidden");
+    if(recapMap){ recapMap.remove(); recapMap=null; }
+    let minLa=90,maxLa=-90,minLo=180,maxLo=-180;
+    for(const p of r.points){ minLa=Math.min(minLa,p.lat);maxLa=Math.max(maxLa,p.lat);minLo=Math.min(minLo,p.lon);maxLo=Math.max(maxLo,p.lon); }
+    recapMap=new maplibregl.Map({container:"map-recap",style:MAP_STYLE,bounds:[[minLo,minLa],[maxLo,maxLa]],fitBoundsOptions:{padding:36},attributionControl:{compact:true},dragRotate:false});
+    recapMap.on("load",()=>{ addRideLayers(recapMap, r); });
+    recapMap.on("error",()=>{});
+  }catch(e){ recapMap=null; $("map-recap").classList.add("hidden"); $("cv-recap").classList.remove("hidden"); }
+}
 
 const GRID = 0.00045;
 const BUMP_G = 4.6;
@@ -242,7 +332,9 @@ function onPosition(p){
     if (n-cellsAtLastChime>=4 && now-lastChimeT>12000){ chime(); toast("✦ new ground — "+n+" cells lit"); lastChimeT=now; cellsAtLastChime=n; }
   }
   updateHUD(fix);
-  if (ride.points.length%4===0) drawTrace($("cv-live"), ride, true);
+  if (!liveMap && ride.points.length===1) initLiveMap(fix);
+  if (liveMap) updateLiveMap(fix);
+  else if (ride.points.length%4===0) drawTrace($("cv-live"), ride, true);
 }
 function onPosError(e){ setChip("dg-gps","GPS: "+(e.code===1?"denied":"error"),"bad"); }
 
@@ -393,6 +485,7 @@ function stopDrive(){
   window.removeEventListener("devicemotion", onMotion);
   clearInterval(timerId);
   clearTimeout(clsTimer); activeClsId=null; pendingCls=[]; $("cls-card").classList.add("hidden"); $("cls-queue").classList.add("hidden");
+  try{ if(liveMap){ liveMap.remove(); liveMap=null; $("map-live").classList.add("hidden"); $("cv-live").classList.remove("hidden"); } }catch(e){ liveMap=null; }
   if(wakeLock){ try{wakeLock.release();}catch(e){} wakeLock=null; }
   if(!ride) return;
   ride.endedAt=Date.now();
@@ -416,9 +509,10 @@ function renderRecap(r){
   const brakes=(r.events||[]).filter(e=>e.type==="hard_brake").length;
   $("rc-note").textContent = cells+" map cells are yours now · "+(r.bumps||[]).length+" road bumps logged for the road-quality map"+(brakes?" · "+brakes+" hard brake"+(brakes>1?"s":""):"");
   show("recap");
-  requestAnimationFrame(()=>drawTrace($("cv-recap"), r, false));
   window.__lastRide=r;
   renderClsList(r);
+  showRecapMap(r);
+  if(!recapMap) requestAnimationFrame(()=>drawTrace($("cv-recap"), r, false));
 }
 
 function syncLabelToStorage(startedAt,id,label){
@@ -495,7 +589,7 @@ $("btn-test").onclick=async()=>{
 
 $("btn-start").onclick=startDrive;
 $("btn-stop").onclick=stopDrive;
-$("btn-new").onclick=()=>{ renderRideList(); show("idle"); };
+$("btn-new").onclick=()=>{ destroyMaps(); renderRideList(); show("idle"); };
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", ()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
