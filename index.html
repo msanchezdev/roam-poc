@@ -65,7 +65,7 @@
   .qchip{display:block;width:100%;text-align:center;font-family:var(--mono);font-size:12px;letter-spacing:.08em;padding:10px;border-radius:100px;border:1px dashed var(--amber);color:var(--amber);background:none;cursor:pointer}
   .cls-row{display:flex;flex-direction:column;gap:8px;background:var(--panel);border:1px solid var(--hair);border-radius:12px;padding:11px 13px}
   .cls-row .m{font-family:var(--mono);font-size:12px;color:var(--ink)}
-  .cls-row .mini{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+  .cls-row .mini{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
   .cls-row .mini button{border:1px solid var(--hair);background:var(--panel2);color:var(--ink);border-radius:9px;padding:8px 4px;font-size:12px;font-weight:600;cursor:pointer}
   .cls-row.done{opacity:.55}
   .cls-row.done .mini{display:none}
@@ -144,6 +144,9 @@
       <div class="stat"><div id="hud-bumps" class="v">0</div><div class="l">BUMPS</div></div>
       <div class="stat"><div id="hud-acc" class="v" style="font-size:16px;padding-top:5px">—</div><div class="l">GPS · IMU</div></div>
     </div>
+    <div id="fix-warn" class="card hidden" style="border-color:var(--danger);padding:10px 14px">
+      <div class="hint" style="color:var(--danger);font-weight:600">⚠ Coarse location — no real GPS lock. Android Settings → Apps → Chrome → Permissions → Location → enable "Use precise location", and disable battery saver.</div>
+    </div>
     <div id="cls-card" class="card hidden" style="display:flex;flex-direction:column;gap:12px">
       <div class="sec-label" style="color:var(--amber)">WHAT WAS THAT?</div>
       <div id="cls-info" class="hint"></div>
@@ -151,7 +154,8 @@
         <button data-l="bump">🟡 Bump</button>
         <button data-l="hole">🕳️ Hole</button>
         <button data-l="dip">〰️ Dip</button>
-        <button data-l="none">✕ Nothing</button>
+        <button data-l="none">✕ False alarm</button>
+        <button data-l="unsure" style="grid-column:span 2">🤷 Not sure</button>
       </div>
       <div class="hint" style="font-size:10.5px">answer only when stopped — it queues by itself in 12 s</div>
     </div>
@@ -202,7 +206,7 @@
 <script>
 (() => {
 "use strict";
-const APP_VERSION = "v0.8";
+const APP_VERSION = "v0.9";
 const $ = id => document.getElementById(id);
 $("ver").textContent = APP_VERSION;
 $("ver2").textContent = APP_VERSION;
@@ -215,7 +219,7 @@ let motionOK = false, lastMotionT = 0, lastPeakT = 0, rmsSumSq = 0, rmsN = 0, la
 let imuCount = 0, imuHz = 0, imuSrc = "—", genericSensor = null;
 setInterval(()=>{ imuHz = imuCount; imuCount = 0; }, 1000);
 let ringBuf = [], pendingCls = [], activeClsId = null, clsTimer = null, bumpSeq = 0;
-const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ Nothing"};
+const LABELS = {bump:"🟡 Bump", hole:"🕳️ Hole", dip:"〰️ Dip", none:"✕ False alarm", unsure:"🤷 Not sure"};
 let liveMap = null, recapMap = null, lastEase = 0;
 let destMap = null, pickedDest = null, nav = null, offRouteN = 0;
 
@@ -423,10 +427,13 @@ function haversine(a,b){
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
+let coarseN=0, coarseWarned=false;
 function onPosition(p){
   const c=p.coords, now=Date.now();
-  setChip("dg-gps","GPS: lock ±"+Math.round(c.accuracy)+"m","ok");
+  setChip("dg-gps","GPS: lock ±"+Math.round(c.accuracy)+"m",(c.accuracy<=18?"ok":""));
   if (!ride) return;
+  if (c.accuracy>18 && (c.speed==null||c.speed<0)) coarseN++; else { coarseN=0; if(coarseWarned){ coarseWarned=false; $("fix-warn").classList.add("hidden"); } }
+  if (coarseN>=6 && !coarseWarned){ coarseWarned=true; $("fix-warn").classList.remove("hidden"); toast("⚠ coarse location — check precise location"); }
   if (c.accuracy > 40) { $("hud-acc").textContent = Math.round(c.accuracy); return; }
   const gpsSp=(c.speed!=null && c.speed>=0)?c.speed:null;
   const fix = {t:now, lat:c.latitude, lon:c.longitude, sp:gpsSp, src:gpsSp!=null?"g":"n", acc:c.accuracy};
@@ -500,7 +507,11 @@ function onSample(x,y,z,inclGravity){
       ride.peaks.push({t:now,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
     }
   }
-  if (mag>BUMP_G && isMoving() && now-lastBumpT>1800){
+  if (mag>BUMP_G && isMoving() && now-lastBumpT>3500){
+    const prevB=ride.bumps[ride.bumps.length-1];
+    if (prevB && now-prevB.t<12000 && haversine(prevB,ride.lastFix)<15){
+      prevB.mag=Math.max(prevB.mag,+mag.toFixed(2)); lastBumpT=now; return;
+    }
     lastBumpT=now;
     const ev={id:++bumpSeq,t:now,lat:ride.lastFix.lat,lon:ride.lastFix.lon,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1),src:imuSrc,label:null,wave:null};
     ride.bumps.push(ev);
