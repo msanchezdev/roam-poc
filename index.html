@@ -202,7 +202,7 @@
 <script>
 (() => {
 "use strict";
-const APP_VERSION = "v0.6";
+const APP_VERSION = "v0.7";
 const $ = id => document.getElementById(id);
 $("ver").textContent = APP_VERSION;
 $("ver2").textContent = APP_VERSION;
@@ -426,13 +426,16 @@ function onPosition(p){
   setChip("dg-gps","GPS: lock ±"+Math.round(c.accuracy)+"m","ok");
   if (!ride) return;
   if (c.accuracy > 40) { $("hud-acc").textContent = Math.round(c.accuracy); return; }
-  const fix = {t:now, lat:c.latitude, lon:c.longitude, sp:(c.speed!=null && c.speed>=0)?c.speed:null, acc:c.accuracy};
+  const gpsSp=(c.speed!=null && c.speed>=0)?c.speed:null;
+  const fix = {t:now, lat:c.latitude, lon:c.longitude, sp:gpsSp, src:gpsSp!=null?"g":"n", acc:c.accuracy};
   const prev = ride.lastFix;
   if (prev){
     const d = haversine(prev,fix), dt=(fix.t-prev.t)/1000;
     if (dt>0 && d<300){
       ride.dist += d;
-      if (fix.sp==null) fix.sp = d/dt;
+      let derived=(dt>0.3 && dt<6 && fix.acc<=30)? d/dt : null;
+      if (derived!=null && derived<0.8) derived=0;
+      if (derived!=null && (fix.sp==null || (fix.sp<0.5 && derived>1.2))){ fix.sp=derived; fix.src="d"; }
       if (prev.sp!=null && fix.sp!=null && dt>=0.5 && dt<3 && fix.acc<=EVENT_ACC_MAX && prev.acc<=EVENT_ACC_MAX){
         const a=(fix.sp-prev.sp)/dt;
         if (Math.abs(a) > A_PLAUSIBLE){ ride.events.push({type:"gps_glitch",t:now,a:+a.toFixed(2),acc:Math.round(fix.acc)}); }
@@ -555,8 +558,11 @@ async function getWakeLock(){
 document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible"&&ride) getWakeLock(); });
 
 function fmtTime(ms){ const s=Math.floor(ms/1000),m=Math.floor(s/60); return m+":"+String(s%60).padStart(2,"0"); }
+let dispSp=0;
 function updateHUD(fix){
-  $("hud-speed").textContent = fix&&fix.sp!=null?Math.round(fix.sp*3.6):0;
+  const cur=fix&&fix.sp!=null?fix.sp*3.6:0;
+  dispSp=Math.abs(cur-dispSp)>25?cur:dispSp*0.45+cur*0.55;
+  $("hud-speed").textContent = Math.round(dispSp);
   $("hud-dist").textContent = (ride.dist/1000).toFixed(1);
   $("hud-smooth").textContent = ride.smooth;
   $("hud-cells").textContent = Object.keys(ride.cells).length;
