@@ -144,6 +144,14 @@
       <div class="stat"><div id="hud-bumps" class="v">0</div><div class="l">BUMPS</div></div>
       <div class="stat"><div id="hud-acc" class="v" style="font-size:16px;padding-top:5px">—</div><div class="l">GPS · IMU</div></div>
     </div>
+    <div id="park-card" class="card hidden" style="display:flex;flex-direction:column;gap:12px;border-color:var(--mint)">
+      <div class="sec-label" style="color:var(--mint)">LOOKS LIKE YOU ARRIVED</div>
+      <div class="hint">No movement for 3 minutes. End the drive and see your recap?</div>
+      <div class="row">
+        <button id="park-dismiss" class="btn ghost">Still driving</button>
+        <button id="park-end" class="btn primary">■ End drive</button>
+      </div>
+    </div>
     <div id="fix-warn" class="card hidden" style="border-color:var(--danger);padding:10px 14px">
       <div class="hint" style="color:var(--danger);font-weight:600">⚠ Coarse location — no real GPS lock. Android Settings → Apps → Chrome → Permissions → Location → enable "Use precise location", and disable battery saver.</div>
     </div>
@@ -206,7 +214,7 @@
 <script>
 (() => {
 "use strict";
-const APP_VERSION = "v0.9";
+const APP_VERSION = "v0.10";
 const $ = id => document.getElementById(id);
 $("ver").textContent = APP_VERSION;
 $("ver2").textContent = APP_VERSION;
@@ -427,7 +435,7 @@ function haversine(a,b){
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
-let coarseN=0, coarseWarned=false;
+let coarseN=0, coarseWarned=false, parkAnchor=null, lastMoveT=0, parkPrompted=false;
 function onPosition(p){
   const c=p.coords, now=Date.now();
   setChip("dg-gps","GPS: lock ±"+Math.round(c.accuracy)+"m",(c.accuracy<=18?"ok":""));
@@ -461,6 +469,12 @@ function onPosition(p){
     const n=Object.keys(ride.cells).length;
     if (n-cellsAtLastChime>=4 && now-lastChimeT>12000){ chime(); toast("✦ new ground — "+n+" cells lit"); lastChimeT=now; cellsAtLastChime=n; }
   }
+  if(!parkAnchor || haversine(parkAnchor,fix)>Math.max(25,fix.acc)){
+    parkAnchor=fix; lastMoveT=now;
+    if(parkPrompted){ parkPrompted=false; $("park-card").classList.add("hidden"); }
+  } else if(now-lastMoveT>180000 && !parkPrompted){
+    parkPrompted=true; $("park-card").classList.remove("hidden"); tone(520,392,0.4,0.1);
+  }
   updateHUD(fix);
   if (!liveMap && ride.points.length===1) initLiveMap(fix);
   if (liveMap) updateLiveMap(fix);
@@ -475,6 +489,14 @@ function isMoving(){
   const pts=ride.points; if(pts.length<2) return false;
   if(Date.now()-ride.lastFix.t>10000) return false;
   for(let i=pts.length-1;i>=0;i--){ if(ride.lastFix.t-pts[i].t>8000) return haversine(pts[i],ride.lastFix)>10; }
+  return false;
+}
+function isMovingStrict(){
+  if(!ride||!ride.lastFix) return false;
+  if((ride.lastFix.sp||0)>1.2) return true;
+  const pts=ride.points; if(pts.length<2) return false;
+  if(Date.now()-ride.lastFix.t>10000) return false;
+  for(let i=pts.length-1;i>=0;i--){ if(ride.lastFix.t-pts[i].t>8000) return haversine(pts[i],ride.lastFix)>Math.max(12,ride.lastFix.acc*0.8); }
   return false;
 }
 function onSample(x,y,z,inclGravity){
@@ -507,7 +529,7 @@ function onSample(x,y,z,inclGravity){
       ride.peaks.push({t:now,mag:+mag.toFixed(2),sp:+(sp*3.6).toFixed(1)});
     }
   }
-  if (mag>BUMP_G && isMoving() && now-lastBumpT>3500){
+  if (mag>BUMP_G && isMovingStrict() && now-lastBumpT>3500){
     const prevB=ride.bumps[ride.bumps.length-1];
     if (prevB && now-prevB.t<12000 && haversine(prevB,ride.lastFix)<15){
       prevB.mag=Math.max(prevB.mag,+mag.toFixed(2)); lastBumpT=now; return;
@@ -666,6 +688,7 @@ function stopDrive(){
   try{ if(genericSensor){ genericSensor.stop(); genericSensor=null; } }catch(e){ genericSensor=null; }
   clearInterval(timerId);
   clearTimeout(clsTimer); activeClsId=null; pendingCls=[]; $("cls-card").classList.add("hidden"); $("cls-queue").classList.add("hidden");
+  parkAnchor=null; parkPrompted=false; $("park-card").classList.add("hidden");
   nav=null; $("nav-banner").classList.add("hidden"); try{ speechSynthesis.cancel(); }catch(e){}
   try{ if(liveMap){ liveMap.remove(); liveMap=null; $("map-live").classList.add("hidden"); $("cv-live").classList.remove("hidden"); } }catch(e){ liveMap=null; }
   if(wakeLock){ try{wakeLock.release();}catch(e){} wakeLock=null; }
@@ -675,8 +698,18 @@ function stopDrive(){
   ride=null;
 }
 
+function arrivalInfo(r){
+  const pts=r.points||[]; if(pts.length<4) return null;
+  const last=pts[pts.length-1];
+  let i=pts.length-1; while(i>0 && haversine(pts[i],last)<30) i--;
+  const arrivedT=pts[Math.min(i+1,pts.length-1)].t;
+  const idleMin=((r.endedAt||last.t)-arrivedT)/60000;
+  return idleMin>=2 ? {arrivedT, idleMin} : null;
+}
 function renderRecap(r){
-  const mins=((r.endedAt||r.startedAt)-r.startedAt)/60000;
+  const arr=arrivalInfo(r);
+  const effEnd=arr?arr.arrivedT:(r.endedAt||r.startedAt);
+  const mins=(effEnd-r.startedAt)/60000;
   const km=r.dist/1000;
   const cells= typeof r.cells==="number" ? r.cells : Object.keys(r.cells||{}).length;
   const avg= mins>0? (km/(mins/60)) : 0;
@@ -689,7 +722,7 @@ function renderRecap(r){
   $("rc-bumps").textContent=(r.bumps||[]).length;
   $("rc-speeds").textContent=Math.round(avg)+" / "+Math.round((r.maxSp||0)*3.6);
   const brakes=(r.events||[]).filter(e=>e.type==="hard_brake").length;
-  $("rc-note").textContent = cells+" map cells are yours now · "+(r.bumps||[]).length+" road bumps logged for the road-quality map"+(brakes?" · "+brakes+" hard brake"+(brakes>1?"s":""):"");
+  $("rc-note").textContent = cells+" map cells are yours now · "+(r.bumps||[]).length+" road bumps logged for the road-quality map"+(brakes?" · "+brakes+" hard brake"+(brakes>1?"s":""):"")+(arr?" · arrived "+new Date(arr.arrivedT).toTimeString().slice(0,5)+", "+Math.round(arr.idleMin)+" min parked after (trimmed from stats)":"");
   show("recap");
   window.__lastRide=r;
   renderClsList(r);
@@ -824,6 +857,8 @@ $("dest-go").onclick=()=>{
 };
 $("btn-start").onclick=()=>{ nav=null; startDrive(); };
 $("btn-stop").onclick=stopDrive;
+$("park-end").onclick=()=>{ $("park-card").classList.add("hidden"); parkPrompted=false; stopDrive(); };
+$("park-dismiss").onclick=()=>{ $("park-card").classList.add("hidden"); parkPrompted=false; lastMoveT=Date.now(); };
 $("btn-new").onclick=()=>{ destroyMaps(); renderRideList(); show("idle"); };
 
 if ("serviceWorker" in navigator) {
