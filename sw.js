@@ -1,4 +1,4 @@
-const CACHE = "roam-v0-7";
+const CACHE = "roam-v0-8";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
